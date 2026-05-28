@@ -118,10 +118,3 @@ func (e *Engine) RunList(ctx context.Context, ips []net.IP, fn ResultFunc) {
 	e2 := New(cfg)
 	e2.Run(ctx, ch, fn)
 }
-
-func max(a, b time.Duration) time.Duration {
-	if a > b {
-		return a
-	}
-	return b
-}
