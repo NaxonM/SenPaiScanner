@@ -193,10 +193,65 @@ func probeTLS(ctx context.Context, ip net.IP, port int, sni string, timeout time
 	return lat, true
 }
 
+// phase1TraceSNIs are fallback SNI hostnames for /cdn-cgi/trace when the
+// primary SNI is blocked or slow on mobile/restricted networks.
+var phase1TraceSNIs = []string{
+	"speed.cloudflare.com",
+	"www.cloudflare.com",
+	"cloudflare.com",
+}
+
+func traceHostsForProbe(primary string) []string {
+	seen := make(map[string]struct{})
+	var hosts []string
+	add := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return
+		}
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		hosts = append(hosts, h)
+	}
+	add(primary)
+	for _, h := range phase1TraceSNIs {
+		add(h)
+	}
+	return hosts
+}
+
 // probeHTTP fetches /cdn-cgi/trace to confirm the IP is a real Cloudflare edge
 // and to determine the colo identifier.
 func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout time.Duration, speedBytes int64, insecure bool, wsHost, wsPath string, requireWS bool) (
 	lat time.Duration, tlsOk bool, httpStatus int, colo string, throughput float64, wsOk bool,
+) {
+	traceSNI := sni
+	for _, host := range traceHostsForProbe(sni) {
+		lat, tlsOk, httpStatus, colo = probeTrace(ctx, ip, port, host, timeout, insecure)
+		if httpStatus >= 200 && httpStatus < 400 && colo != "" {
+			traceSNI = host
+			break
+		}
+	}
+	if httpStatus < 200 || httpStatus >= 400 || colo == "" {
+		return lat, tlsOk, httpStatus, colo, 0, false
+	}
+
+	if speedBytes > 0 {
+		throughput = probeDownload(ctx, ip, port, timeout, speedBytes, insecure)
+	}
+	if requireWS {
+		wsOk = probeWebSocket(ctx, ip, port, traceSNI, wsHost, wsPath, timeout)
+	}
+	return
+}
+
+// probeTrace performs a single /cdn-cgi/trace GET against ip while using host
+// as the TLS SNI and HTTP authority.
+func probeTrace(ctx context.Context, ip net.IP, port int, host string, timeout time.Duration, insecure bool) (
+	lat time.Duration, tlsOk bool, httpStatus int, colo string,
 ) {
 	addr := fmt.Sprintf("%s:%d", ip.String(), port)
 
@@ -209,7 +264,7 @@ func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout tim
 			return (&net.Dialer{Timeout: timeout / 4}).DialContext(ctx, network, addr)
 		},
 		TLSClientConfig: &tls.Config{
-			ServerName:         sni,
+			ServerName:         host,
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: insecure,
 		},
@@ -226,18 +281,19 @@ func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout tim
 	if port == 80 {
 		scheme = "http"
 	}
-	url := fmt.Sprintf("%s://%s/cdn-cgi/trace", scheme, sni)
+	url := fmt.Sprintf("%s://%s/cdn-cgi/trace", scheme, host)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return
 	}
 	req.Header.Set("User-Agent", "senpaiscanner/1.0")
+	req.Host = host
 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, false, 0, "", 0, false
+		return 0, false, 0, ""
 	}
 	lat = time.Since(start)
 	defer resp.Body.Close()
@@ -250,16 +306,6 @@ func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout tim
 	if traceColo := parseColoCDN(string(body)); traceColo != "" {
 		colo = traceColo
 	}
-
-	if httpStatus >= 200 && httpStatus < 400 && colo != "" {
-		if speedBytes > 0 {
-			throughput = probeDownload(ctx, ip, port, timeout, speedBytes)
-		}
-		if speedBytes > 0 || requireWS {
-			wsOk = probeWebSocket(ctx, ip, port, sni, wsHost, wsPath, timeout)
-		}
-	}
-
 	return
 }
 
@@ -394,7 +440,7 @@ func normalizeWSPath(path string) string {
 // probeDownload fetches a small sample from speed.cloudflare.com while forcing
 // the TCP connection to the candidate IP. This is still not a full Xray/V2Ray
 // test, but it catches many IPs that handshake cleanly and then stall on data.
-func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Duration, bytes int64) float64 {
+func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Duration, bytes int64, insecure bool) float64 {
 	if bytes <= 0 {
 		return 0
 	}
@@ -405,8 +451,9 @@ func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Durati
 			return (&net.Dialer{Timeout: timeout / 4}).DialContext(ctx, network, addr)
 		},
 		TLSClientConfig: &tls.Config{
-			ServerName: "speed.cloudflare.com",
-			MinVersion: tls.VersionTLS12,
+			ServerName:         "speed.cloudflare.com",
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: insecure,
 		},
 		DisableKeepAlives:   true,
 		TLSHandshakeTimeout: timeout / 2,

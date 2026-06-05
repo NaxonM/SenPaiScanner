@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -139,13 +138,17 @@ func mobileValidateOnce(ctx context.Context, cfg *xraytest.VLESSConfig, timeout 
 		return res
 	}
 
-	proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+	proxyURL := fmt.Sprintf("socks5h://127.0.0.1:%d", socksPort)
 
-	testCtx, cancel := context.WithTimeout(ctx, timeout)
+	connectTimeout := timeout
+	if connectTimeout > 18*time.Second {
+		connectTimeout = 18 * time.Second
+	}
+	testCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 
-	// Step 1: connectivity check via cloudflare trace.
-	traceOk, latency, traceErr := mobileConnectivityCheck(testCtx, proxyURL)
+	// Step 1: connectivity check (tunnel path, IP trace, then data-path fallback).
+	traceOk, latency, traceErr := xraytest.ProxyConnectivityCheck(testCtx, proxyURL, cfg)
 	res.Latency = latency
 	if !traceOk {
 		res.Error = fmt.Sprintf("connectivity: %v", traceErr)
@@ -153,7 +156,7 @@ func mobileValidateOnce(ctx context.Context, cfg *xraytest.VLESSConfig, timeout 
 	}
 
 	// Step 2: best-effort speed measurement (does not affect Success).
-	speedCtx, speedCancel := context.WithTimeout(testCtx, mobileSpeedBudget(timeout, latency))
+	speedCtx, speedCancel := context.WithTimeout(ctx, mobileSpeedBudget(timeout, latency))
 	defer speedCancel()
 	bytesRecv, throughput := mobileSpeedTest(speedCtx, proxyURL, cfg)
 	res.BytesRecv = bytesRecv
@@ -201,63 +204,14 @@ func mobileClientTimeout(ctx context.Context, fallback time.Duration) time.Durat
 	return fallback
 }
 
-func mobileConnectivityCheck(ctx context.Context, proxyAddr string) (bool, time.Duration, error) {
-	transport := mobileProxyTransport(proxyAddr)
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   mobileClientTimeout(ctx, 15*time.Second),
-	}
-
-	start := time.Now()
-	var latency time.Duration
-	gotFirst := false
-	trace := &httptrace.ClientTrace{
-		GotFirstResponseByte: func() {
-			if !gotFirst {
-				latency = time.Since(start)
-				gotFirst = true
-			}
-		},
-	}
-	traceCtx := httptrace.WithClientTrace(ctx, trace)
-
-	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, mobileTraceURL, nil)
-	if err != nil {
-		return false, 0, err
-	}
-	req.Header.Set("User-Agent", "senpaiscanner/1.0")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, latency, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return false, latency, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	if !strings.Contains(string(body), "colo=") {
-		return false, latency, fmt.Errorf("no colo in trace response")
-	}
-	if !gotFirst {
-		latency = time.Since(start)
-	}
-	return true, latency, nil
-}
-
 func mobileSpeedBudget(total, spent time.Duration) time.Duration {
-	budget := total / 2
-	if budget < 8*time.Second {
-		budget = 8 * time.Second
-	}
+	budget := 4 * time.Second
 	remaining := total - spent
 	if remaining < budget {
 		budget = remaining
 	}
-	if budget < 2*time.Second {
-		return 2 * time.Second
+	if budget < time.Second {
+		return time.Second
 	}
 	return budget
 }

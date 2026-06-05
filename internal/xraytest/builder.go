@@ -3,6 +3,8 @@ package xraytest
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"strings"
 )
 
 // BuildXrayConfig generates a minimal xray-core JSON config from a VLESSConfig.
@@ -15,7 +17,13 @@ func BuildXrayConfig(cfg *VLESSConfig, socksPort int) ([]byte, error) {
 			"error":    "",
 		},
 		"dns": map[string]interface{}{
-			"servers": []string{"1.1.1.1", "8.8.8.8"},
+			// Prefer the OS resolver first — on cellular, direct UDP to 1.1.1.1
+			// is often blocked while system DNS still works.
+			"servers": []interface{}{
+				"localhost",
+				"1.1.1.1",
+				"8.8.8.8",
+			},
 		},
 		"inbounds": []map[string]interface{}{
 			{
@@ -23,9 +31,10 @@ func BuildXrayConfig(cfg *VLESSConfig, socksPort int) ([]byte, error) {
 				"port":     socksPort,
 				"listen":   "127.0.0.1",
 				"protocol": "socks",
+				// Sniffing overrides the SOCKS destination with sniffed domains and
+				// breaks IP-based CF endpoint tests — keep disabled for validation.
 				"sniffing": map[string]interface{}{
-					"enabled":      true,
-					"destOverride": []string{"http", "tls"},
+					"enabled": false,
 				},
 				"settings": map[string]interface{}{
 					"udp": true,
@@ -38,6 +47,16 @@ func BuildXrayConfig(cfg *VLESSConfig, socksPort int) ([]byte, error) {
 				"tag":      "direct",
 				"protocol": "freedom",
 				"settings": map[string]interface{}{},
+			},
+		},
+		"routing": map[string]interface{}{
+			"domainStrategy": "AsIs",
+			"rules": []map[string]interface{}{
+				{
+					"type":        "field",
+					"outboundTag": "proxy",
+					"network":     "tcp,udp",
+				},
 			},
 		},
 	}
@@ -111,8 +130,12 @@ func buildStreamSettings(cfg *VLESSConfig) map[string]interface{} {
 		if cfg.Fingerprint != "" {
 			tls["fingerprint"] = cfg.Fingerprint
 		}
-		if cfg.Insecure {
-			tls["allowInsecure"] = true
+		// allowInsecure was removed from xray-core after 2026-06-01. When dialing
+		// a literal IP, xray expects verifyPeerCertByName instead.
+		if net.ParseIP(cfg.Address) != nil {
+			if vcn := peerCertNames(cfg); vcn != "" {
+				tls["verifyPeerCertByName"] = vcn
+			}
 		}
 		if len(cfg.ALPN) > 0 {
 			tls["alpn"] = cfg.ALPN
@@ -163,6 +186,29 @@ func buildStreamSettings(cfg *VLESSConfig) map[string]interface{} {
 	}
 
 	return stream
+}
+
+func peerCertNames(cfg *VLESSConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	seen := make(map[string]struct{})
+	var names []string
+	add := func(n string) {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			return
+		}
+		key := strings.ToLower(n)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		names = append(names, n)
+	}
+	add(cfg.Host)
+	add(cfg.SNI)
+	return strings.Join(names, ",")
 }
 
 // BuildXrayConfigJSON is a convenience that returns the config as a formatted string.

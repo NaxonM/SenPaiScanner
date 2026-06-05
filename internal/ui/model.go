@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -2509,7 +2511,7 @@ func runConfigScan(rawURL string) {
 
 	for i, ip := range testIPs {
 		swapped := cfg.WithAddress(ip)
-		r := xraytest.ValidateConfig(ctx, swapped, 20*time.Second)
+		r := xraytest.ValidateConfig(ctx, swapped, 30*time.Second)
 		if prog != nil {
 			prog.Send(ConfigProgressMsg{
 				Result: r,
@@ -2943,22 +2945,63 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result) {
 
 	ctx := context.Background()
 	total := len(topIPs)
+	if total == 0 {
+		if prog != nil {
+			prog.Send(ConfigDoneMsg{})
+		}
+		return
+	}
 
-	for i, r := range topIPs {
-		ip := r.IP.String()
-		swapped := cfg.WithEndpoint(ip, r.Port)
-		vr := xraytest.ValidateConfig(ctx, swapped, 20*time.Second)
-		if liveResultWriter != nil {
-			liveResultWriter.AddPhase2(vr)
+	if errMsg := cfg.Phase2SanityError(); errMsg != "" {
+		for i, r := range topIPs {
+			vr := &xraytest.ValidationResult{
+				IP:        r.IP.String(),
+				Port:      r.Port,
+				Transport: cfg.Network,
+				Error:     errMsg,
+			}
+			if liveResultWriter != nil {
+				liveResultWriter.AddPhase2(vr)
+			}
+			if prog != nil {
+				prog.Send(ConfigProgressMsg{Result: vr, Done: i + 1, Total: total})
+			}
 		}
 		if prog != nil {
-			prog.Send(ConfigProgressMsg{
-				Result: vr,
-				Done:   i + 1,
-				Total:  total,
-			})
+			prog.Send(ConfigDoneMsg{})
 		}
+		return
 	}
+
+	const phase2Workers = 3
+	sem := make(chan struct{}, phase2Workers)
+	var wg sync.WaitGroup
+	var done atomic.Int32
+
+	for _, r := range topIPs {
+		r := r
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			swapped := cfg.WithEndpoint(r.IP.String(), r.Port)
+			vr := xraytest.ValidateConfig(ctx, swapped, 22*time.Second)
+			if liveResultWriter != nil {
+				liveResultWriter.AddPhase2(vr)
+			}
+			if prog != nil {
+				prog.Send(ConfigProgressMsg{
+					Result: vr,
+					Done:   int(done.Add(1)),
+					Total:  total,
+				})
+			}
+		}()
+	}
+
+	wg.Wait()
 
 	if prog != nil {
 		prog.Send(ConfigDoneMsg{})

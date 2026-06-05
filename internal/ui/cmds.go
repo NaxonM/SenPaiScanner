@@ -505,12 +505,12 @@ func runConfigPortProbesWithProbe(ctx context.Context, ips <-chan net.IP, ports 
 
 func defaultPhase1ProbeConfig(timeout time.Duration) prober.Config {
 	return prober.Config{
-		Port:       443,
-		Mode:       prober.ModeHTTP,
-		Tries:      3,
-		Timeout:    timeout,
-		SNI:        "speed.cloudflare.com",
-		SpeedBytes: 64 * 1024,
+		Port:               443,
+		Mode:               prober.ModeHTTP,
+		Tries:              3,
+		Timeout:            timeout,
+		SNI:                "speed.cloudflare.com",
+		InsecureSkipVerify: true,
 	}
 }
 
@@ -536,7 +536,8 @@ func configProbeFromURL(rawURL string, timeout time.Duration) (prober.Config, er
 	if cfg.Network == "ws" {
 		probeCfg.WebSocketHost = cfg.Host
 		probeCfg.WebSocketPath = cfg.Path
-		probeCfg.RequireWebSocket = true
+		// Phase 2 validates WS+VLESS through xray. A naked WS upgrade probe
+		// false-fails on cellular/DPI even when the real tunnel works.
 	}
 	return probeCfg, nil
 }

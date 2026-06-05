@@ -119,6 +119,53 @@ func TestBuildXrayConfig_GRPC(t *testing.T) {
 	}
 }
 
+func TestBuildXrayConfig_NoAllowInsecureForIPAddress(t *testing.T) {
+	cfg := &VLESSConfig{
+		UUID:        "12345678-1234-1234-1234-123456789abc",
+		Address:     "188.114.97.3",
+		Port:        443,
+		Encryption:  "none",
+		Network:     "ws",
+		Path:        "/tunnel",
+		Host:        "worker.example.dev",
+		Security:    "tls",
+		SNI:         "Worker.Example.Dev",
+		Fingerprint: "chrome",
+		Insecure:    false,
+	}
+
+	configBytes, err := BuildXrayConfig(cfg, 10812)
+	if err != nil {
+		t.Fatalf("BuildXrayConfig failed: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(configBytes, &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	outbounds := parsed["outbounds"].([]interface{})
+	proxy := outbounds[0].(map[string]interface{})
+	stream := proxy["streamSettings"].(map[string]interface{})
+	tlsSettings := stream["tlsSettings"].(map[string]interface{})
+	if _, has := tlsSettings["allowInsecure"]; has {
+		t.Fatalf("allowInsecure must not be set (removed from xray-core): %v", tlsSettings["allowInsecure"])
+	}
+	if tlsSettings["serverName"] != "Worker.Example.Dev" {
+		t.Fatalf("serverName = %v, want Worker.Example.Dev", tlsSettings["serverName"])
+	}
+	if tlsSettings["verifyPeerCertByName"] != "worker.example.dev" {
+		t.Fatalf("verifyPeerCertByName = %v", tlsSettings["verifyPeerCertByName"])
+	}
+
+	inbounds := parsed["inbounds"].([]interface{})
+	inbound := inbounds[0].(map[string]interface{})
+	sniffing := inbound["sniffing"].(map[string]interface{})
+	if sniffing["enabled"].(bool) {
+		t.Fatal("sniffing should be disabled for validation configs")
+	}
+}
+
 func TestBuildXrayConfig_AddressSwap(t *testing.T) {
 	raw := "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&path=%2Fdownload&host=example.com#test"
 

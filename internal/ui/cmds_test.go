@@ -31,8 +31,8 @@ func TestConfigProbeFromURLUsesConfigPortSNIAndWebSocket(t *testing.T) {
 	if cfg.WebSocketPath != "/" {
 		t.Fatalf("WebSocketPath = %q, want /", cfg.WebSocketPath)
 	}
-	if !cfg.RequireWebSocket {
-		t.Fatal("RequireWebSocket = false, want true")
+	if cfg.RequireWebSocket {
+		t.Fatal("RequireWebSocket = true, want false (Phase 2 validates WS)")
 	}
 }
 

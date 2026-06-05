@@ -77,16 +77,12 @@ func ParseVLESS(raw string) (*VLESSConfig, error) {
 	}
 	remark, _ = url.QueryUnescape(remark)
 
-	// Split params
-	params := url.Values{}
+	var query string
 	if idx := strings.Index(raw, "?"); idx != -1 {
-		var err error
-		params, err = url.ParseQuery(raw[idx+1:])
-		if err != nil {
-			return nil, fmt.Errorf("parsing query params: %w", err)
-		}
+		query = raw[idx+1:]
 		raw = raw[:idx]
 	}
+	params := parseShareQuery(query)
 
 	// Split UUID@address:port
 	atIdx := strings.Index(raw, "@")
@@ -150,7 +146,19 @@ func ParseVLESS(raw string) (*VLESSConfig, error) {
 		cfg.ALPN = strings.Split(alpnStr, ",")
 	}
 
+	cfg.SNI = normalizeKnownHostTypos(cfg.SNI)
+	cfg.Host = normalizeKnownHostTypos(cfg.Host)
+
 	return cfg, nil
+}
+
+// normalizeKnownHostTypos fixes common paste/save typos that break Phase 2 while
+// Phase 1 still passes (Phase 1 falls back to generic Cloudflare trace SNIs).
+func normalizeKnownHostTypos(host string) string {
+	if strings.Contains(host, ".worers.dev") {
+		return strings.ReplaceAll(host, ".worers.dev", ".workers.dev")
+	}
+	return host
 }
 
 // WithAddress returns a copy of the config with the address replaced.
@@ -283,6 +291,100 @@ func recoverMissingQuerySep(portStr string, params url.Values) (int, url.Values,
 	return port, params, nil
 }
 
+// vlessQueryKeys lists share-link parameter names used to delimit values that
+// may contain '&' or '?' (common in CF worker WS paths).
+var vlessQueryKeys = []string{
+	"encryption", "security", "sni", "fp", "alpn", "insecure", "allowInsecure",
+	"type", "host", "path", "serviceName", "authority", "mode", "flow", "ed",
+	"packetEncoding", "headerType", "seed", "pbk", "sid", "spx",
+}
+
+func parseShareQuery(query string) url.Values {
+	params := make(url.Values)
+	if query == "" {
+		return params
+	}
+	parsed, err := url.ParseQuery(query)
+	if err == nil {
+		for k, vs := range parsed {
+			params[k] = vs
+		}
+	}
+	for _, key := range []string{"path", "host", "sni"} {
+		if v := extractQueryValue(query, key); v != "" {
+			params.Set(key, v)
+		}
+	}
+	normalizeSharePath(params)
+	return params
+}
+
+func extractQueryValue(query, key string) string {
+	prefix := key + "="
+	idx := strings.Index(query, prefix)
+	if idx < 0 {
+		idx = strings.Index(query, "&"+prefix)
+		if idx >= 0 {
+			idx++
+		}
+	}
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(prefix)
+	end := len(query)
+	for _, k := range vlessQueryKeys {
+		if k == key {
+			continue
+		}
+		sep := "&" + k + "="
+		if j := strings.Index(query[start:], sep); j >= 0 && start+j < end {
+			end = start + j
+		}
+	}
+	val, err := url.QueryUnescape(query[start:end])
+	if err != nil {
+		return query[start:end]
+	}
+	return val
+}
+
+func normalizeSharePath(params url.Values) {
+	path := params.Get("path")
+	if path == "" {
+		return
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if ed := params.Get("ed"); ed != "" && !strings.Contains(path, "ed=") {
+		if strings.Contains(path, "?") {
+			path += "&ed=" + ed
+		} else {
+			path += "?ed=" + ed
+		}
+	}
+	params.Set("path", path)
+}
+
+// Phase2SanityError reports config problems that make Phase 2 fail while Phase 1
+// can still pass (Phase 1 does not require a valid WS path).
+func (c *VLESSConfig) Phase2SanityError() string {
+	if c == nil {
+		return "empty config"
+	}
+	switch c.Network {
+	case "ws", "xhttp", "splithttp":
+		if c.Host == "" && c.SNI == "" {
+			return "missing host/sni in VLESS link"
+		}
+		if len(c.Path) < 24 && strings.Contains(c.Path, "eyJ") {
+			return fmt.Sprintf("WS path looks truncated (%d chars) — re-paste the full vless:// link with encoded path", len(c.Path))
+		}
+	}
+	return ""
+}
+
 func paramOr(params url.Values, key, fallback string) string {
 	v := params.Get(key)
 	if v == "" {
@@ -309,15 +411,12 @@ func ParseTrojan(raw string) (*VLESSConfig, error) {
 	remark, _ = url.QueryUnescape(remark)
 
 	// Split params
-	params := url.Values{}
+	var query string
 	if idx := strings.Index(raw, "?"); idx != -1 {
-		var err error
-		params, err = url.ParseQuery(raw[idx+1:])
-		if err != nil {
-			return nil, fmt.Errorf("parsing query params: %w", err)
-		}
+		query = raw[idx+1:]
 		raw = raw[:idx]
 	}
+	params := parseShareQuery(query)
 
 	// Split password@address:port
 	atIdx := strings.Index(raw, "@")

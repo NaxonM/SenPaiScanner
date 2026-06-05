@@ -2,6 +2,7 @@ package xraytest
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,42 @@ func TestParseVLESS_XHTTP(t *testing.T) {
 	assertEqual(t, "Path", cfg.Path, "/download")
 	assertEqual(t, "Host", cfg.Host, "test.example.org")
 	assertEqual(t, "Mode", cfg.Mode, "auto")
+}
+
+func TestParseVLESS_WorkersDevMixedSNIHost(t *testing.T) {
+	raw := "vless://3a24f4fb-c574-43f4-8041-2c1a381779af@188.114.97.3:443?encryption=none&security=tls&sni=MmM.matin3sALEaZIRAn.WoRKerS.DEv&fp=chrome&alpn=http%2F1.1&insecure=0&allowInsecure=0&type=ws&host=mmm.matin3saleaziran.workers.dev&path=%2FeyJqdW5rIjoidmlIaTNjaHNmWE1pIiwicHJvdG9jb2wiOiJ2bCIsIm1vZGUiOiJwcmVmaXgiLCJwYW5lbElQcyI6WyJbMjYwMjpmYzU5OmIwOjY0OjpdIl19%3Fed%3D2560#test"
+
+	cfg, err := ParseVLESS(raw)
+	if err != nil {
+		t.Fatalf("ParseVLESS failed: %v", err)
+	}
+	if cfg.SNI != "MmM.matin3sALEaZIRAn.WoRKerS.DEv" {
+		t.Fatalf("SNI = %q", cfg.SNI)
+	}
+	if cfg.Host != "mmm.matin3saleaziran.workers.dev" {
+		t.Fatalf("Host = %q", cfg.Host)
+	}
+	if cfg.ALPN[0] != "http/1.1" {
+		t.Fatalf("ALPN = %v", cfg.ALPN)
+	}
+	if !strings.HasPrefix(cfg.Path, "/eyJ") {
+		t.Fatalf("Path = %q", cfg.Path)
+	}
+
+	swapped := cfg.WithEndpoint("188.114.97.3", 443)
+	b, err := BuildXrayConfig(swapped, 20002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"allowInsecure"`) {
+		t.Fatalf("allowInsecure must not appear in xray config, got %s", string(b))
+	}
+	if !strings.Contains(string(b), `"serverName": "MmM.matin3sALEaZIRAn.WoRKerS.DEv"`) {
+		t.Fatalf("expected serverName in TLS settings, got %s", string(b))
+	}
+	if !strings.Contains(string(b), `"verifyPeerCertByName"`) {
+		t.Fatalf("expected verifyPeerCertByName for IP endpoint, got %s", string(b))
+	}
 }
 
 func TestWithAddress(t *testing.T) {

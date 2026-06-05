@@ -183,7 +183,6 @@ func runScan(configJson string, callback Callback) {
 		if xCfg.Network == "ws" {
 			probeCfg.WebSocketHost = xCfg.Host
 			probeCfg.WebSocketPath = xCfg.Path
-			probeCfg.RequireWebSocket = true
 		}
 		ports = []int{xCfg.Port}
 	} else {
@@ -192,12 +191,11 @@ func runScan(configJson string, callback Callback) {
 			ports = []int{443}
 		}
 		probeCfg = prober.Config{
-			Mode:             prober.ModeHTTP,
-			Tries:            3,
-			Timeout:          timeout,
-			SNI:              "speed.cloudflare.com",
-			SpeedBytes:       64 * 1024,
-			RequireWebSocket: true,
+			Mode:               prober.ModeHTTP,
+			Tries:              3,
+			Timeout:            timeout,
+			SNI:                "speed.cloudflare.com",
+			InsecureSkipVerify: true,
 		}
 	}
 
@@ -529,7 +527,7 @@ phase1Done:
 				break
 			}
 			swapped := xCfg.WithEndpoint(r.IP.String(), r.Port)
-			vr := mobileValidateConfig(ctx, swapped, 20*time.Second)
+			vr := mobileValidateConfig(ctx, swapped, 22*time.Second)
 
 			atomic.AddInt32(&statsTested, 1)
 			atomic.AddInt32(&statsInFlight, -1)

@@ -101,13 +101,13 @@ func TestHTTPHealthRequiresCloudflareValidation(t *testing.T) {
 	}
 
 	r.SpeedTested = true
-	if r.IsHealthy() {
-		t.Fatal("expected speed-tested result with zero throughput to be unhealthy")
+	if !r.IsHealthy() {
+		t.Fatal("expected trace-validated result to stay healthy without throughput (mobile-friendly)")
 	}
 
 	r.Throughput = 256 * 1024
 	if !r.IsHealthy() {
-		t.Fatal("expected speed-tested result with throughput to be healthy")
+		t.Fatal("expected speed-tested result with throughput to remain healthy")
 	}
 }
 

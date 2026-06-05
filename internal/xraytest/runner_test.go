@@ -29,10 +29,30 @@ func TestSpeedTestTargetsPreferConfigHost(t *testing.T) {
 	}
 }
 
+func TestTraceTargetsPreferConfigIP(t *testing.T) {
+	cfg := &VLESSConfig{
+		Address: "104.17.89.5",
+		Port:    2087,
+		Host:    "worker.example.dev",
+		SNI:     "worker.example.dev",
+	}
+	targets := traceTargetsForConfig(cfg)
+	if len(targets) < 3 {
+		t.Fatalf("targets = %d, want at least 3", len(targets))
+	}
+	want := "https://104.17.89.5:2087/cdn-cgi/trace"
+	if targets[0].url != want || targets[0].host != "worker.example.dev" {
+		t.Fatalf("first target = %+v, want url=%s host=worker.example.dev", targets[0], want)
+	}
+}
+
 func TestSpeedBudgetReservesTimeForSpeedTest(t *testing.T) {
-	got := speedBudget(20*time.Second, 900*time.Millisecond)
-	if got < 8*time.Second {
-		t.Fatalf("budget = %s, want at least 8s", got)
+	got := speedBudget(22*time.Second, 900*time.Millisecond)
+	if got < 4*time.Second {
+		t.Fatalf("budget = %s, want at least 4s", got)
+	}
+	if got > 6*time.Second {
+		t.Fatalf("budget = %s, want at most ~4s", got)
 	}
 }
 
@@ -57,8 +77,8 @@ func TestProxyConnectivityCheckFallsBackToSecondTraceTarget(t *testing.T) {
 
 	ok, latency, err := proxyConnectivityCheckTargets(
 		t.Context(),
-		&http.Client{Timeout: time.Second},
-		[]string{failedTarget.URL, workingTarget.URL},
+		"",
+		[]traceTarget{{url: failedTarget.URL}, {url: workingTarget.URL}},
 	)
 	if err != nil {
 		t.Fatalf("proxyConnectivityCheckTargets returned error: %v", err)
@@ -79,8 +99,8 @@ func TestProxyConnectivityCheckReportsTraceTargetFailures(t *testing.T) {
 
 	ok, _, err := proxyConnectivityCheckTargets(
 		t.Context(),
-		&http.Client{Timeout: time.Second},
-		[]string{badBodyTarget.URL},
+		"",
+		[]traceTarget{{url: badBodyTarget.URL}},
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -90,5 +110,28 @@ func TestProxyConnectivityCheckReportsTraceTargetFailures(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no colo") {
 		t.Fatalf("error = %q, want no colo context", err)
+	}
+}
+
+func TestProxyConnectivityCheckTargetAccepts2xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("colo=TEST\n"))
+	}))
+	defer srv.Close()
+
+	ok, latency, err := proxyConnectivityCheckTarget(
+		t.Context(),
+		"",
+		srv.URL,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected ok=true for 204 with colo body")
+	}
+	if latency <= 0 {
+		t.Fatalf("latency = %s, want positive", latency)
 	}
 }

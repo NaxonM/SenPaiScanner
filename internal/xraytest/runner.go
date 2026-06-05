@@ -2,6 +2,7 @@ package xraytest
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -126,6 +127,8 @@ func validateOnce(ctx context.Context, cfg *VLESSConfig, timeout time.Duration) 
 		}
 
 		if err := instance.Start(); err != nil {
+			instance.Close()
+			instance = nil
 			return fmt.Errorf("start xray: %w", err)
 		}
 		return nil
@@ -134,20 +137,33 @@ func validateOnce(ctx context.Context, cfg *VLESSConfig, timeout time.Duration) 
 		res.Error = err.Error()
 		return res
 	}
-	defer instance.Close()
+	defer func() {
+		_ = withSuppressedXrayOutput(func() error {
+			if instance != nil {
+				instance.Close()
+			}
+			return nil
+		})
+	}()
 
-	if !waitForPort(socksPort, 3*time.Second) {
-		res.Error = "socks port not ready after 3s"
+	if !waitForPort(socksPort, 5*time.Second) {
+		res.Error = "socks port not ready after 5s"
 		return res
 	}
 
-	proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+	// socks5h resolves hostnames through the proxy — required on cellular where
+	// local DNS is blocked but the VLESS tunnel still works.
+	proxyURL := fmt.Sprintf("socks5h://127.0.0.1:%d", socksPort)
 
-	testCtx, cancel := context.WithTimeout(ctx, timeout)
+	connectTimeout := timeout
+	if connectTimeout > 18*time.Second {
+		connectTimeout = 18 * time.Second
+	}
+	testCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 
-	// Step 1: lightweight connectivity check and true TTFB latency.
-	traceOk, latency, traceErr := proxyConnectivityCheck(testCtx, proxyURL)
+	// Step 1: connectivity check and true TTFB latency.
+	traceOk, latency, traceErr := proxyConnectivityCheck(testCtx, proxyURL, cfg)
 	res.Latency = latency
 	if !traceOk {
 		res.Error = fmt.Sprintf("connectivity: %v", traceErr)
@@ -155,7 +171,7 @@ func validateOnce(ctx context.Context, cfg *VLESSConfig, timeout time.Duration) 
 	}
 
 	// Step 2: best-effort download speed (does not affect Success).
-	speedCtx, speedCancel := context.WithTimeout(testCtx, speedBudget(timeout, latency))
+	speedCtx, speedCancel := context.WithTimeout(ctx, speedBudget(timeout, latency))
 	defer speedCancel()
 	bytesRecv, throughput := measureProxySpeed(speedCtx, proxyURL, cfg)
 	res.BytesRecv = bytesRecv
@@ -164,46 +180,100 @@ func validateOnce(ctx context.Context, cfg *VLESSConfig, timeout time.Duration) 
 	return res
 }
 
-// proxyConnectivityCheck performs a lightweight GET /cdn-cgi/trace through the
-// SOCKS5 proxy to cp.cloudflare.com. It returns true when the response body
-// contains "colo=", proving that real Cloudflare traffic flowed through the proxy.
-func proxyConnectivityCheck(ctx context.Context, proxyAddr string) (bool, time.Duration, error) {
-	transport := proxyTransport(proxyAddr)
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   clientTimeoutForContext(ctx, 15*time.Second),
-	}
-
-	return proxyConnectivityCheckTargets(ctx, client, traceProbeURLs)
+type traceTarget struct {
+	url  string
+	host string // HTTP Host / authority when url dials the CF IP directly
 }
 
-func proxyConnectivityCheckTargets(ctx context.Context, client *http.Client, targets []string) (bool, time.Duration, error) {
-	if len(targets) == 0 {
-		return false, 0, fmt.Errorf("no trace probe targets configured")
+// traceTargetsForConfig builds connectivity probe URLs. The IP-based target
+// matches Phase 1 (no DNS lookup) and is tried first — critical on cellular
+// where UDP DNS to 1.1.1.1 is often blocked but the VLESS tunnel works.
+func traceTargetsForConfig(cfg *VLESSConfig) []traceTarget {
+	var targets []traceTarget
+	seen := make(map[string]struct{})
+	add := func(url, host string) {
+		if url == "" {
+			return
+		}
+		key := url + "|" + host
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, traceTarget{url: url, host: host})
 	}
 
-	var failures []string
-	var lastLatency time.Duration
-	for _, target := range targets {
-		ok, latency, err := proxyConnectivityCheckTarget(ctx, client, target)
+	if cfg != nil && cfg.Address != "" {
+		host := cfg.Host
+		if host == "" {
+			host = cfg.SNI
+		}
+		if host != "" {
+			port := cfg.Port
+			if port <= 0 {
+				port = 443
+			}
+			scheme := "https"
+			if port == 80 {
+				scheme = "http"
+			}
+			add(fmt.Sprintf("%s://%s:%d/cdn-cgi/trace", scheme, cfg.Address, port), host)
+			add(fmt.Sprintf("%s://%s:%d/cdn-cgi/trace", scheme, host, port), "")
+		}
+	}
+
+	for _, u := range traceProbeURLs {
+		add(u, "")
+	}
+	return targets
+}
+
+func tunnelPathTargets(cfg *VLESSConfig) []traceTarget {
+	if cfg == nil || cfg.Address == "" {
+		return nil
+	}
+	host := cfg.Host
+	if host == "" {
+		host = cfg.SNI
+	}
+	if host == "" {
+		return nil
+	}
+	path := cfg.Path
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	port := cfg.Port
+	if port <= 0 {
+		port = 443
+	}
+	scheme := "https"
+	if port == 80 {
+		scheme = "http"
+	}
+	return []traceTarget{{
+		url:  fmt.Sprintf("%s://%s:%d%s", scheme, cfg.Address, port, path),
+		host: host,
+	}}
+}
+
+func proxyTunnelPathCheck(ctx context.Context, proxyAddr string, cfg *VLESSConfig) (bool, time.Duration, error) {
+	for _, target := range tunnelPathTargets(cfg) {
+		ok, latency, err := proxyRelaxedEndpointCheck(ctx, proxyAddr, target.url, target.host, 1)
 		if ok {
 			return true, latency, nil
 		}
-		if latency > 0 {
-			lastLatency = latency
-		}
 		if err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", target, err))
-		}
-		if ctx.Err() != nil {
-			return false, lastLatency, ctx.Err()
+			return false, latency, err
 		}
 	}
-
-	return false, lastLatency, fmt.Errorf("trace probe failed: %s", strings.Join(failures, "; "))
+	return false, 0, fmt.Errorf("tunnel path unreachable")
 }
 
-func proxyConnectivityCheckTarget(ctx context.Context, client *http.Client, target string) (bool, time.Duration, error) {
+func proxyRelaxedEndpointCheck(ctx context.Context, proxyAddr, targetURL, authority string, minBytes int64) (bool, time.Duration, error) {
 	start := time.Now()
 	var latency time.Duration
 	gotFirst := false
@@ -217,11 +287,169 @@ func proxyConnectivityCheckTarget(ctx context.Context, client *http.Client, targ
 	}
 	traceCtx := httptrace.WithClientTrace(ctx, trace)
 
+	client := &http.Client{
+		Transport: proxyTransportForTarget(proxyAddr, targetURL, authority),
+		Timeout:   clientTimeoutForContext(ctx, 20*time.Second),
+	}
+	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return false, 0, err
+	}
+	req.Header.Set("User-Agent", "senpaiscanner/1.0")
+	if authority != "" {
+		req.Host = authority
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, latency, err
+	}
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status >= 500 {
+		return false, latency, fmt.Errorf("HTTP %d", status)
+	}
+	if n < minBytes {
+		return false, latency, fmt.Errorf("short response (%d bytes)", n)
+	}
+	if !gotFirst {
+		latency = time.Since(start)
+	}
+	return true, latency, nil
+}
+
+// ProxyConnectivityCheck performs a lightweight connectivity test through the
+// SOCKS5 proxy. Exported for the Android gomobile bridge.
+func ProxyConnectivityCheck(ctx context.Context, proxyAddr string, cfg *VLESSConfig) (bool, time.Duration, error) {
+	return proxyConnectivityCheck(ctx, proxyAddr, cfg)
+}
+
+// proxyConnectivityCheck performs a lightweight GET /cdn-cgi/trace through the
+// SOCKS5 proxy. It returns true when the response body contains "colo=",
+// proving that real Cloudflare traffic flowed through the proxy.
+func proxyConnectivityCheck(ctx context.Context, proxyAddr string, cfg *VLESSConfig) (bool, time.Duration, error) {
+	// Domain-first: SOCKS traffic uses natural TLS SNI and the worker forwards it.
+	if cfg != nil {
+		host := cfg.Host
+		if host == "" {
+			host = cfg.SNI
+		}
+		if host != "" {
+			domainTrace := "https://" + host + "/cdn-cgi/trace"
+			if ok, latency, err := proxyConnectivityCheckTarget(ctx, proxyAddr, domainTrace, ""); ok {
+				return true, latency, nil
+			} else if err != nil {
+				_ = err
+			}
+			if cfg.Path != "" {
+				path := cfg.Path
+				if !strings.HasPrefix(path, "/") {
+					path = "/" + path
+				}
+				domainPath := "https://" + host + path
+				if ok, latency, err := proxyRelaxedEndpointCheck(ctx, proxyAddr, domainPath, "", 1); ok {
+					return true, latency, nil
+				} else if err != nil {
+					_ = err
+				}
+			}
+		}
+	}
+
+	// Then hit the WS path through the CF IP (TLS SNI overridden in transport).
+	if cfg != nil {
+		if ok, latency, err := proxyTunnelPathCheck(ctx, proxyAddr, cfg); ok {
+			return true, latency, nil
+		} else if err != nil {
+			_ = err
+		}
+	}
+
+	targets := traceTargetsForConfig(cfg)
+	ok, latency, err := proxyConnectivityCheckTargets(ctx, proxyAddr, targets)
+	if ok {
+		return true, latency, nil
+	}
+
+	// Fallback: a small download through the config host/path proves the tunnel
+	// carries data even when trace endpoints are filtered on cellular links.
+	if cfg != nil {
+		if ok, dlLatency, dlErr := proxyDataPathCheck(ctx, proxyAddr, cfg); ok {
+			if dlLatency > 0 {
+				return true, dlLatency, nil
+			}
+			return true, latency, nil
+		} else if dlErr != nil {
+			if err != nil {
+				err = fmt.Errorf("%v; data-path: %v", err, dlErr)
+			} else {
+				err = dlErr
+			}
+		}
+	}
+
+	return false, latency, err
+}
+
+func proxyConnectivityCheckTargets(ctx context.Context, proxyAddr string, targets []traceTarget) (bool, time.Duration, error) {
+	if len(targets) == 0 {
+		return false, 0, fmt.Errorf("no trace probe targets configured")
+	}
+
+	var failures []string
+	var lastLatency time.Duration
+	for _, target := range targets {
+		ok, latency, err := proxyConnectivityCheckTarget(ctx, proxyAddr, target.url, target.host)
+		if ok {
+			return true, latency, nil
+		}
+		if latency > 0 {
+			lastLatency = latency
+		}
+		if err != nil {
+			label := target.url
+			if target.host != "" {
+				label = fmt.Sprintf("%s (host=%s)", target.url, target.host)
+			}
+			failures = append(failures, fmt.Sprintf("%s: %v", label, err))
+		}
+		if ctx.Err() != nil {
+			return false, lastLatency, ctx.Err()
+		}
+	}
+
+	errMsg := fmt.Errorf("trace probe failed: %s", strings.Join(failures, "; "))
+	return false, lastLatency, errMsg
+}
+
+func proxyConnectivityCheckTarget(ctx context.Context, proxyAddr, target, authority string) (bool, time.Duration, error) {
+	start := time.Now()
+	var latency time.Duration
+	gotFirst := false
+	trace := &httptrace.ClientTrace{
+		GotFirstResponseByte: func() {
+			if !gotFirst {
+				latency = time.Since(start)
+				gotFirst = true
+			}
+		},
+	}
+	traceCtx := httptrace.WithClientTrace(ctx, trace)
+
+	client := &http.Client{
+		Transport: proxyTransportForTarget(proxyAddr, target, authority),
+		Timeout:   clientTimeoutForContext(ctx, 20*time.Second),
+	}
+
 	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, target, nil)
 	if err != nil {
 		return false, 0, err
 	}
 	req.Header.Set("User-Agent", "senpaiscanner/1.0")
+	if authority != "" {
+		req.Host = authority
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -229,7 +457,7 @@ func proxyConnectivityCheckTarget(ctx context.Context, client *http.Client, targ
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 		return false, latency, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
@@ -243,23 +471,38 @@ func proxyConnectivityCheckTarget(ctx context.Context, client *http.Client, targ
 	return true, latency, nil
 }
 
+func proxyDataPathCheck(ctx context.Context, proxyAddr string, cfg *VLESSConfig) (bool, time.Duration, error) {
+	const sample = speedMinBytes * 2
+	for _, target := range tunnelPathTargets(cfg) {
+		ok, latency, _ := proxyRelaxedEndpointCheck(ctx, proxyAddr, target.url, target.host, speedMinBytes)
+		if ok {
+			return true, latency, nil
+		}
+	}
+	for _, target := range speedTestTargets(cfg, sample) {
+		ok, latency, _ := proxyRelaxedEndpointCheck(ctx, proxyAddr, target.url, target.host, target.minBytes)
+		if ok {
+			return true, latency, nil
+		}
+	}
+	return false, 0, fmt.Errorf("no data-path response")
+}
+
 type speedTarget struct {
 	url      string
+	host     string // HTTP Host when url dials a CF IP directly
 	relaxed  bool
 	minBytes int64
 }
 
 func speedBudget(total, spent time.Duration) time.Duration {
-	budget := total / 2
-	if budget < 8*time.Second {
-		budget = 8 * time.Second
-	}
+	budget := 4 * time.Second
 	remaining := total - spent
 	if remaining < budget {
 		budget = remaining
 	}
-	if budget < 2*time.Second {
-		return 2 * time.Second
+	if budget < time.Second {
+		return time.Second
 	}
 	return budget
 }
@@ -268,7 +511,7 @@ func measureProxySpeed(ctx context.Context, proxyAddr string, cfg *VLESSConfig) 
 	samples := []int64{speedSampleBytes, speedSampleBytesFast}
 	for _, sample := range samples {
 		for _, target := range speedTestTargets(cfg, sample) {
-			bytesRecv, throughput, err := downloadThroughProxy(ctx, proxyAddr, target.url, sample, target.relaxed)
+			bytesRecv, throughput, err := downloadThroughProxy(ctx, proxyAddr, target.url, sample, target.relaxed, target.host)
 			if err == nil && bytesRecv >= target.minBytes && throughput > 0 {
 				return bytesRecv, throughput
 			}
@@ -306,6 +549,14 @@ func speedTestTargets(cfg *VLESSConfig, sampleBytes int64) []speedTarget {
 		if host == "" {
 			host = cfg.SNI
 		}
+		port := cfg.Port
+		if port <= 0 {
+			port = 443
+		}
+		scheme := "https"
+		if port == 80 {
+			scheme = "http"
+		}
 		if host != "" {
 			paths := []string{"/"}
 			if cfg.Path != "" {
@@ -315,6 +566,15 @@ func speedTestTargets(cfg *VLESSConfig, sampleBytes int64) []speedTarget {
 			for _, path := range paths {
 				if !strings.HasPrefix(path, "/") {
 					path = "/" + path
+				}
+				if cfg.Address != "" {
+					ipURL := fmt.Sprintf("%s://%s:%d%s", scheme, cfg.Address, port, path)
+					if _, ok := seen[ipURL]; !ok {
+						seen[ipURL] = struct{}{}
+						targets = append(targets, speedTarget{
+							url: ipURL, host: host, relaxed: true, minBytes: minBytes,
+						})
+					}
 				}
 				u := "https://" + host + path
 				if _, ok := seen[u]; ok {
@@ -349,7 +609,7 @@ func burstProxyThroughput(ctx context.Context, proxyAddr, url string, targetByte
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				n, _, err := downloadThroughProxy(ctx, proxyAddr, url, 16384, true)
+				n, _, err := downloadThroughProxy(ctx, proxyAddr, url, 16384, true, "")
 				if err != nil || n <= 0 {
 					return
 				}
@@ -373,14 +633,39 @@ func burstProxyThroughput(ctx context.Context, proxyAddr, url string, targetByte
 }
 
 func proxyTransport(proxyAddr string) *http.Transport {
-	return &http.Transport{
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			return url.Parse(proxyAddr)
-		},
+	return proxyTransportForTarget(proxyAddr, "", "")
+}
+
+// proxyTransportForTarget builds a SOCKS transport. When the probe URL dials a
+// literal IP but the HTTP authority is a domain (typical CF IP scans), TLS must
+// use the domain as ServerName — req.Host alone does not fix the ClientHello.
+func proxyTransportForTarget(proxyAddr, targetURL, authority string) *http.Transport {
+	t := &http.Transport{
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 		DisableKeepAlives:   true,
 	}
+	if proxyAddr != "" {
+		t.Proxy = func(req *http.Request) (*url.URL, error) {
+			return url.Parse(proxyAddr)
+		}
+	}
+	if authority == "" || targetURL == "" {
+		return t
+	}
+	u, err := url.Parse(targetURL)
+	if err != nil || u.Scheme != "https" {
+		return t
+	}
+	if net.ParseIP(u.Hostname()) == nil {
+		return t
+	}
+	serverName := authority
+	if h, _, err := net.SplitHostPort(authority); err == nil {
+		serverName = h
+	}
+	t.TLSClientConfig = &tls.Config{ServerName: serverName}
+	return t
 }
 
 func clientTimeoutForContext(ctx context.Context, fallback time.Duration) time.Duration {
@@ -397,13 +682,13 @@ func clientTimeoutForContext(ctx context.Context, fallback time.Duration) time.D
 // downloadThroughProxy fetches a URL through a SOCKS5 proxy and returns bytes
 // received plus throughput in bytes/sec. When relaxed is true, any HTTP response
 // with a readable body counts (needed for WS endpoints that answer 400/404).
-func downloadThroughProxy(ctx context.Context, proxyAddr, dlURL string, maxBytes int64, relaxed bool) (int64, float64, error) {
+func downloadThroughProxy(ctx context.Context, proxyAddr, dlURL string, maxBytes int64, relaxed bool, authority string) (int64, float64, error) {
 	if maxBytes <= 0 {
 		return 0, 0, fmt.Errorf("invalid maxBytes %d", maxBytes)
 	}
 
 	client := &http.Client{
-		Transport: proxyTransport(proxyAddr),
+		Transport: proxyTransportForTarget(proxyAddr, dlURL, authority),
 		Timeout:   clientTimeoutForContext(ctx, 30*time.Second),
 	}
 
@@ -412,6 +697,9 @@ func downloadThroughProxy(ctx context.Context, proxyAddr, dlURL string, maxBytes
 		return 0, 0, err
 	}
 	req.Header.Set("User-Agent", "senpaiscanner/1.0")
+	if authority != "" {
+		req.Host = authority
+	}
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -450,23 +738,29 @@ func waitForPort(port int, timeout time.Duration) bool {
 }
 
 func withSuppressedXrayOutput(fn func() error) error {
+	restore := suppressXrayOutput()
+	defer restore()
+	return fn()
+}
+
+func suppressXrayOutput() func() {
 	stdioMu.Lock()
-	defer stdioMu.Unlock()
 
 	oldStdout := os.Stdout
 	oldStderr := os.Stderr
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
-		return fn()
+		stdioMu.Unlock()
+		return func() {}
 	}
-	defer devNull.Close()
 
 	os.Stdout = devNull
 	os.Stderr = devNull
-	defer func() {
+
+	return func() {
 		os.Stdout = oldStdout
 		os.Stderr = oldStderr
-	}()
-
-	return fn()
+		devNull.Close()
+		stdioMu.Unlock()
+	}
 }

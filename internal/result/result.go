@@ -114,9 +114,8 @@ func (r *Result) IsHealthy() bool {
 		if r.HTTPStatus < 200 || r.HTTPStatus >= 400 || r.Colo == "" {
 			return false
 		}
-		if r.SpeedTested && r.Throughput <= 0 {
-			return false
-		}
+		// Throughput is informational in Phase 1; trace reachability is enough.
+		// Slow mobile links often pass trace but fail a 64 KiB sample download.
 		if r.RequireWS && !r.WSOk {
 			return false
 		}

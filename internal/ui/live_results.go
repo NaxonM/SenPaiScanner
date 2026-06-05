@@ -185,8 +185,8 @@ func (w *LiveResultWriter) writeLocked() error {
 	if w.phase >= 2 && !w.phase1Only {
 		sb.WriteString("\n")
 		sb.WriteString(fmt.Sprintf("=== Phase 2 — xray validation (%d tested) ===\n\n", len(w.phase2Rows)))
-		sb.WriteString(fmt.Sprintf("  %-22s  %-8s  %8s  %8s  %6s\n", "ENDPOINT", "TYPE", "SPEED", "LATENCY", "STATUS"))
-		sb.WriteString("  " + strings.Repeat("─", 64) + "\n")
+		sb.WriteString(fmt.Sprintf("  %-22s  %-8s  %8s  %8s  %6s  %s\n", "ENDPOINT", "TYPE", "SPEED", "LATENCY", "STATUS", "ERROR"))
+		sb.WriteString("  " + strings.Repeat("─", 96) + "\n")
 		if len(w.phase2Rows) == 0 {
 			sb.WriteString("  (no validation results yet)\n")
 		} else {
@@ -194,17 +194,21 @@ func (w *LiveResultWriter) writeLocked() error {
 				status := "fail"
 				speed := "—"
 				latency := "—"
+				errText := "—"
 				if r.Success {
 					status = "ok"
 					speed = formatValidationSpeed(r.Throughput)
 					latency = formatValidationLatency(r.Latency)
+				} else if r.Error != "" {
+					errText = r.Error
 				}
-				sb.WriteString(fmt.Sprintf("  %-22s  %-8s  %8s  %8s  %6s\n",
+				sb.WriteString(fmt.Sprintf("  %-22s  %-8s  %8s  %8s  %6s  %s\n",
 					formatEndpoint(r.IP, r.Port),
 					r.Transport,
 					speed,
 					latency,
 					status,
+					errText,
 				))
 			}
 		}
