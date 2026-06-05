@@ -56,7 +56,10 @@ func mobileNextPort() int {
 	return int(mobilePortCounter.Add(1))
 }
 
-const mobileTraceURL = "https://cp.cloudflare.com/cdn-cgi/trace"
+var mobileTraceURLs = []string{
+	"https://cp.cloudflare.com/cdn-cgi/trace",
+	"https://cloudflare.com/cdn-cgi/trace",
+}
 
 // mobileValidateConfig is the Android-safe replacement for xraytest.ValidateConfig.
 // It starts an xray instance, sends test traffic through it, and returns
@@ -208,6 +211,36 @@ func mobileConnectivityCheck(ctx context.Context, proxyAddr string) (bool, time.
 		Timeout:   mobileClientTimeout(ctx, 15*time.Second),
 	}
 
+	return mobileConnectivityCheckTargets(ctx, client, mobileTraceURLs)
+}
+
+func mobileConnectivityCheckTargets(ctx context.Context, client *http.Client, targets []string) (bool, time.Duration, error) {
+	if len(targets) == 0 {
+		return false, 0, fmt.Errorf("no trace probe targets configured")
+	}
+
+	var failures []string
+	var lastLatency time.Duration
+	for _, target := range targets {
+		ok, latency, err := mobileConnectivityCheckTarget(ctx, client, target)
+		if ok {
+			return true, latency, nil
+		}
+		if latency > 0 {
+			lastLatency = latency
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", target, err))
+		}
+		if ctx.Err() != nil {
+			return false, lastLatency, ctx.Err()
+		}
+	}
+
+	return false, lastLatency, fmt.Errorf("trace probe failed: %s", strings.Join(failures, "; "))
+}
+
+func mobileConnectivityCheckTarget(ctx context.Context, client *http.Client, target string) (bool, time.Duration, error) {
 	start := time.Now()
 	var latency time.Duration
 	gotFirst := false
@@ -221,7 +254,7 @@ func mobileConnectivityCheck(ctx context.Context, proxyAddr string) (bool, time.
 	}
 	traceCtx := httptrace.WithClientTrace(ctx, trace)
 
-	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, mobileTraceURL, nil)
+	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, target, nil)
 	if err != nil {
 		return false, 0, err
 	}
@@ -332,7 +365,7 @@ func mobileSpeedTest(ctx context.Context, proxyAddr string, cfg *xraytest.VLESSC
 	}
 
 	// Last fallback: burst trace requests.
-	return mobileBurstThroughput(ctx, proxyAddr, mobileTraceURL, sampleBytes)
+	return mobileBurstThroughput(ctx, proxyAddr, mobileTraceURLs[0], sampleBytes)
 }
 
 func mobileBurstThroughput(ctx context.Context, proxyAddr, targetURL string, targetBytes int64) (int64, float64) {
