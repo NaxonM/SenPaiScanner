@@ -22,6 +22,7 @@ import (
 
 	"github.com/matinsenpai/senpaiscanner/internal/engine"
 	"github.com/matinsenpai/senpaiscanner/internal/ipsrc"
+	"github.com/matinsenpai/senpaiscanner/internal/logger"
 	"github.com/matinsenpai/senpaiscanner/internal/output"
 	"github.com/matinsenpai/senpaiscanner/internal/prober"
 	"github.com/matinsenpai/senpaiscanner/internal/result"
@@ -32,6 +33,12 @@ import (
 // abort it when the user presses esc/q.
 var scanCancel context.CancelFunc
 var scanIDCounter atomic.Int64
+
+// scanLog is the global logger instance, set by SetLogger at startup.
+var scanLog *logger.Logger
+
+// SetLogger sets the global logger instance. Must be called before any scan.
+func SetLogger(l *logger.Logger) { scanLog = l }
 
 func nextScanID() int64 { return scanIDCounter.Add(1) }
 
@@ -110,9 +117,15 @@ func runScan(cfg ScanConfig, scanID int64) {
 		}
 	}
 
+	scanLog.ScanStart(logger.PhaseQuick, map[string]any{
+		"count": count, "workers": concurrency, "timeout": timeout,
+		"tries": tries, "port": port, "mode": mode, "sni": cfg.SNI,
+	})
+
 	useBuiltin := len(extra) == 0
 	src, err := ipsrc.NewWithOptions(cfg.UseV4, cfg.UseV6, extra, ipsrc.Options{UseBuiltin: useBuiltin})
 	if err != nil {
+		scanLog.Error(logger.PhaseQuick, "setup failed: %v", err)
 		sendError(scanID, fmt.Sprintf("Scan setup failed: %v", err))
 		sendDone(scanID)
 		return
@@ -145,23 +158,30 @@ func runScan(cfg ScanConfig, scanID int64) {
 			writer = w
 			defer writer.Close()
 		} else {
+			scanLog.Warn(logger.PhaseQuick, "output disabled: %v", e)
 			sendError(scanID, fmt.Sprintf("Output disabled: %v", e))
 		}
 	}
 
+	var tested, healthy int64
 	ipStream := src.Stream(ctx, count)
 	eng.Run(ctx, ipStream, func(r *result.Result) {
+		s := eng.Stats()
+		tested = s.Tested.Load()
+		healthy = s.Healthy.Load()
 		if prog != nil {
-			s := eng.Stats()
-			prog.Send(StatsMsg{ScanID: scanID, Tested: s.Tested.Load(), Healthy: s.Healthy.Load(), Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
+			prog.Send(StatsMsg{ScanID: scanID, Tested: tested, Healthy: healthy, Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
 		}
 		if !passesColoFilter(r, coloSet) {
 			return
 		}
-		// Only healthy IPs go to the output file; writing every scanned IP
-		// would flood the file with thousands of failed probes.
+		if !r.IsHealthy() {
+			scanLog.ProbeFailure(logger.PhaseQuick, formatEndpoint(r.IP.String(), r.Port),
+				fmt.Sprintf("loss=%.0f%% avg=%.0fms", r.Loss(), float64(r.Avg().Milliseconds())))
+		}
 		if writer != nil && r.IsHealthy() {
 			if err := writer.Write(r); err != nil {
+				scanLog.Warn(logger.PhaseQuick, "output write failed: %v", err)
 				sendError(scanID, fmt.Sprintf("Output write failed: %v", err))
 			}
 		}
@@ -170,21 +190,28 @@ func runScan(cfg ScanConfig, scanID int64) {
 		}
 	})
 
+	scanLog.ScanComplete(logger.PhaseQuick, int(tested), int(healthy), 0)
 	sendDone(scanID)
 }
 
 func runTest(ipFile string, scanID int64) {
 	ips, err := loadIPs(ipFile)
 	if err != nil {
+		scanLog.Error(logger.PhaseQuick, "test IPs failed: %v", err)
 		sendError(scanID, fmt.Sprintf("Test IPs failed: %v", err))
 		sendDone(scanID)
 		return
 	}
 	if len(ips) == 0 {
+		scanLog.Error(logger.PhaseQuick, "no valid IPs found in %s", ipFile)
 		sendError(scanID, fmt.Sprintf("Test IPs failed: no valid IPs found in %s", ipFile))
 		sendDone(scanID)
 		return
 	}
+
+	scanLog.ScanStart(logger.PhaseQuick, map[string]any{
+		"file": ipFile, "ips": len(ips), "mode": "http", "tries": 6,
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	scanCancel = cancel
@@ -204,24 +231,31 @@ func runTest(ipFile string, scanID int64) {
 	}
 	eng := engine.New(engCfg)
 
+	var tested, healthy int64
 	eng.RunList(ctx, ips, func(r *result.Result) {
+		s := eng.Stats()
+		tested = s.Tested.Load()
+		healthy = s.Healthy.Load()
 		if prog != nil {
-			s := eng.Stats()
 			prog.Send(ResultMsg{ScanID: scanID, Result: r})
-			prog.Send(StatsMsg{ScanID: scanID, Tested: s.Tested.Load(), Healthy: s.Healthy.Load(), Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
+			prog.Send(StatsMsg{ScanID: scanID, Tested: tested, Healthy: healthy, Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
 		}
 	})
 
+	scanLog.ScanComplete(logger.PhaseQuick, int(tested), int(healthy), 0)
 	sendDone(scanID)
 }
 
 func runColos(scanID int64) {
 	src, err := ipsrc.New(true, false, nil)
 	if err != nil {
+		scanLog.Error(logger.PhaseColos, "setup failed: %v", err)
 		sendError(scanID, fmt.Sprintf("Colo discovery failed: %v", err))
 		sendColosDone(scanID)
 		return
 	}
+
+	scanLog.ScanStart(logger.PhaseColos, map[string]any{"count": 300})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	scanCancel = cancel
@@ -240,10 +274,13 @@ func runColos(scanID int64) {
 	eng := engine.New(engCfg)
 	ipStream := src.Stream(ctx, 300)
 
+	var tested, healthy int64
 	eng.Run(ctx, ipStream, func(r *result.Result) {
+		s := eng.Stats()
+		tested = s.Tested.Load()
+		healthy = s.Healthy.Load()
 		if prog != nil {
-			s := eng.Stats()
-			prog.Send(StatsMsg{ScanID: scanID, Tested: s.Tested.Load(), Healthy: s.Healthy.Load(), Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
+			prog.Send(StatsMsg{ScanID: scanID, Tested: tested, Healthy: healthy, Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
 		}
 		if !r.IsHealthy() || r.Colo == "" {
 			return
@@ -253,6 +290,7 @@ func runColos(scanID int64) {
 		}
 	})
 
+	scanLog.ScanComplete(logger.PhaseColos, int(tested), int(healthy), 0)
 	sendColosDone(scanID)
 }
 
@@ -285,6 +323,7 @@ func runConfigPhase1(opts configPhase1Options) {
 	} else {
 		probeCfg, err = configProbeFromURL(opts.rawURL, opts.timeout)
 		if err != nil {
+			scanLog.Error(logger.Phase1, "invalid URL: %v", err)
 			if prog != nil {
 				prog.Send(ConfigPhase1ErrMsg{Err: fmt.Sprintf("invalid URL: %v", err)})
 			}
@@ -297,11 +336,31 @@ func runConfigPhase1(opts configPhase1Options) {
 		ports = []int{probeCfg.Port}
 	}
 
+	source := "random Cloudflare IPv4"
+	if opts.fromFile {
+		source = "ips.txt"
+	}
+	scanLog.ScanStart(logger.Phase1, map[string]any{
+		"count": opts.count, "workers": opts.concurrency,
+		"timeout": opts.timeout, "ports": ports, "source": source,
+		"requireWS": opts.requireWS,
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	scanCancel = cancel
 	defer cancel()
 
+	var tested, healthy int
+	var totalLatencyMs float64
 	callback := func(r *result.Result) {
+		tested++
+		if r.IsHealthy() {
+			healthy++
+			totalLatencyMs += float64(r.Avg().Milliseconds())
+		} else {
+			scanLog.ProbeFailure(logger.Phase1, formatEndpoint(r.IP.String(), r.Port),
+				fmt.Sprintf("loss=%.0f%% avg=%.0fms colo=%s", r.Loss(), float64(r.Avg().Milliseconds()), r.Colo))
+		}
 		if liveResultWriter != nil {
 			liveResultWriter.AddPhase1(r)
 		}
@@ -315,12 +374,14 @@ func runConfigPhase1(opts configPhase1Options) {
 	if opts.fromFile {
 		ips, err := loadDefaultIPsFile()
 		if err != nil {
+			scanLog.Error(logger.Phase1, "failed to load IPs: %v", err)
 			if prog != nil {
 				prog.Send(ConfigPhase1ErrMsg{Err: err.Error()})
 			}
 			return
 		}
 		if len(ips) == 0 {
+			scanLog.Error(logger.Phase1, "ips.txt is empty")
 			if prog != nil {
 				prog.Send(ConfigPhase1ErrMsg{Err: "ips.txt is empty — add one IP per line"})
 			}
@@ -338,6 +399,7 @@ func runConfigPhase1(opts configPhase1Options) {
 	} else {
 		src, err := ipsrc.New(true, false, nil)
 		if err != nil {
+			scanLog.Error(logger.Phase1, "IP source failed: %v", err)
 			if prog != nil {
 				prog.Send(ConfigPhase1DoneMsg{})
 			}
@@ -353,6 +415,12 @@ func runConfigPhase1(opts configPhase1Options) {
 		}
 	}
 	runConfigPortProbes(ctx, ipStream, ports, opts.concurrency, probeCfg, callback, neighbor)
+
+	var avgMs float64
+	if healthy > 0 {
+		avgMs = totalLatencyMs / float64(healthy)
+	}
+	scanLog.ScanComplete(logger.Phase1, tested, healthy, avgMs)
 
 	if prog != nil {
 		prog.Send(ConfigPhase1DoneMsg{})

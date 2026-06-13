@@ -17,4 +17,5 @@ const (
 	PageConfigSetup    // legacy setup (unused)
 	PageConfigPhase1   // xray config - fast connectivity scan
 	PageConfigPhase2   // xray config - xray validation
+	PageLogViewer      // scan log viewer
 )

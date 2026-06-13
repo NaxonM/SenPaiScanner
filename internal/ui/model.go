@@ -20,6 +20,7 @@ import (
 
 	"github.com/matinsenpai/senpaiscanner/internal/banner"
 	"github.com/matinsenpai/senpaiscanner/internal/config"
+	"github.com/matinsenpai/senpaiscanner/internal/logger"
 	"github.com/matinsenpai/senpaiscanner/internal/result"
 	"github.com/matinsenpai/senpaiscanner/internal/xraytest"
 )
@@ -259,6 +260,9 @@ type AppModel struct {
 	configSpeedSizeCustom string
 	configUploadTest      bool
 	ispInfo               string
+
+	// log viewer
+	logViewerLines []string
 
 	// shared
 	statusMsg string
@@ -668,6 +672,8 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleConfigPhase1Key(msg)
 	case PageConfigPhase2:
 		return m.handleScanWithConfigKey(msg)
+	case PageLogViewer:
+		return m.handleLogViewerKey(msg)
 	}
 	return m, nil
 }
@@ -1276,6 +1282,8 @@ func (m AppModel) View() string {
 		return m.viewConfigPhase1()
 	case PageConfigPhase2:
 		return m.viewScanWithConfig()
+	case PageLogViewer:
+		return m.viewLogViewer()
 	}
 	return ""
 }
@@ -2152,6 +2160,9 @@ func (m AppModel) viewScanWithConfig() string {
 	}
 	if m.configDone {
 		hint := "  c copy working endpoints   e export Clash/Sing-Box/Sub configs   q/esc back to menu"
+		if scanLog != nil && scanLog.HasFailures() {
+			hint += fmt.Sprintf("   l view %s", scanLog.FailureSummary())
+		}
 		if m.liveResultPath != "" {
 			hint += "\n" + styleDim.Render("  live results → "+m.liveResultPath)
 		}
@@ -2236,6 +2247,11 @@ func (m AppModel) handleScanWithConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if m.configDone {
 			m.statusMsg = m.exportAllConfigs()
+			return m, nil
+		}
+	case "l":
+		if (m.configDone || m.configPhase1Done) && scanLog != nil && scanLog.HasFailures() {
+			m.openLogViewer()
 			return m, nil
 		}
 	}
@@ -3079,7 +3095,11 @@ func (m AppModel) viewConfigPhase1() string {
 	}
 
 	if m.configPhase1Done && m.configPhase1Only {
-		sb.WriteString(styleHint.Render("  c copy healthy endpoints   q/esc back") + "\n")
+		hint := "  c copy healthy endpoints   q/esc back"
+		if scanLog != nil && scanLog.HasFailures() {
+			hint += fmt.Sprintf("   l view %s", scanLog.FailureSummary())
+		}
+		sb.WriteString(styleHint.Render(hint) + "\n")
 	} else {
 		sb.WriteString(styleHint.Render("  q/esc cancel") + "\n")
 	}
@@ -3091,6 +3111,11 @@ func (m AppModel) handleConfigPhase1Key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "c":
 		if m.configPhase1Done && m.configPhase1Only {
 			m.statusMsg = m.copyPhase1HealthyEndpoints()
+			return m, nil
+		}
+	case "l":
+		if m.configPhase1Done && scanLog != nil && scanLog.HasFailures() {
+			m.openLogViewer()
 			return m, nil
 		}
 	case "esc", "q":
@@ -3273,6 +3298,7 @@ func (m AppModel) startConfigPhase2(topIPs []*result.Result) tea.Cmd {
 func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, speedURL string, speedSize int64, timeout time.Duration, uploadTest bool) {
 	cfg, err := xraytest.ParseProxyURL(rawURL)
 	if err != nil {
+		scanLog.Error(logger.Phase2, "invalid URL: %v", err)
 		if prog != nil {
 			prog.Send(ConfigDoneMsg{})
 		}
@@ -3282,6 +3308,7 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, s
 	ctx := context.Background()
 	total := len(topIPs)
 	if total == 0 {
+		scanLog.Info(logger.Phase2, "no candidates to validate")
 		if prog != nil {
 			prog.Send(ConfigDoneMsg{})
 		}
@@ -3289,6 +3316,7 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, s
 	}
 
 	if errMsg := cfg.Phase2SanityError(); errMsg != "" {
+		scanLog.Error(logger.Phase2, "config sanity check failed: %s", errMsg)
 		for i, r := range topIPs {
 			vr := &xraytest.ValidationResult{
 				IP:        r.IP.String(),
@@ -3309,9 +3337,15 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, s
 		return
 	}
 
+	scanLog.ScanStart(logger.Phase2, map[string]any{
+		"candidates": total, "timeout": timeout, "minSpeed": minSpeed,
+		"network": cfg.Network, "workers": phase2WorkersCount,
+	})
+
 	sem := make(chan struct{}, phase2WorkersCount)
 	var wg sync.WaitGroup
 	var done atomic.Int32
+	var working int32
 
 	for _, r := range topIPs {
 		r := r
@@ -3333,6 +3367,12 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, s
 					vr.Error = fmt.Sprintf("speed below threshold (%.1f < %.1f Mbps)", mbps, minSpeed)
 				}
 			}
+			if vr.Success {
+				working++
+				scanLog.ProbeSuccess(logger.Phase2, formatEndpoint(vr.IP, vr.Port), float64(vr.Latency.Milliseconds()))
+			} else {
+				scanLog.ProbeFailure(logger.Phase2, formatEndpoint(vr.IP, vr.Port), vr.Error)
+			}
 			if liveResultWriter != nil {
 				liveResultWriter.AddPhase2(vr)
 			}
@@ -3348,6 +3388,7 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, s
 
 	wg.Wait()
 
+	scanLog.ScanComplete(logger.Phase2, total, int(working), 0)
 	if prog != nil {
 		prog.Send(ConfigDoneMsg{})
 	}
@@ -3568,4 +3609,77 @@ func (m AppModel) exportAllConfigs() string {
 	_ = os.WriteFile(clashPath, []byte(strings.Join(clashLines, "\n")+"\n"), 0644)
 
 	return fmt.Sprintf("✓ configs exported to Clash, Sing-Box, and Sub files in %s", dir)
+}
+
+// ---------------------------------------------------------------------------
+// Log Viewer
+// ---------------------------------------------------------------------------
+
+func (m AppModel) viewLogViewer() string {
+	var sb strings.Builder
+
+	sb.WriteString(styleTitle.Render("\n  📋  Scan Log\n"))
+	sb.WriteString(fmt.Sprintf("%s\n\n", styleSep.Render("  "+strings.Repeat("─", minInt(m.width-4, 70)))))
+
+	if len(m.logViewerLines) == 0 {
+		sb.WriteString(styleDim.Render("  No log entries found.\n\n"))
+	} else {
+		maxRows := m.height - 8
+		if maxRows < 5 {
+			maxRows = 5
+		}
+		lines := m.logViewerLines
+		if len(lines) > maxRows {
+			lines = lines[len(lines)-maxRows:]
+		}
+		for _, line := range lines {
+			lineStyle := styleNormal
+			switch {
+			case strings.Contains(line, "[ERROR]"):
+				lineStyle = styleBad
+			case strings.Contains(line, "[WARN ]"):
+				lineStyle = styleWarn
+			case strings.Contains(line, "[INFO ]"):
+				lineStyle = styleNormal
+			case strings.Contains(line, "[DEBUG]"):
+				lineStyle = styleDim
+			}
+			sb.WriteString(lineStyle.Render("  " + line) + "\n")
+		}
+	}
+
+	sb.WriteRune('\n')
+	sb.WriteString(styleHint.Render("  q/esc back to scan"))
+	sb.WriteRune('\n')
+	return sb.String()
+}
+
+func (m AppModel) handleLogViewerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc", "enter":
+		m.page = PageConfigPhase1
+		if m.configPhase1Done {
+			if m.configPhase1Only {
+				m.page = PageConfigPhase1
+			} else {
+				m.page = PageConfigPhase2
+			}
+		}
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m *AppModel) openLogViewer() {
+	if scanLog == nil {
+		return
+	}
+	dir := scanLog.LogDir()
+	if dir == "" {
+		return
+	}
+	m.logViewerLines = logger.GetRecentLogLines(dir, 200)
+	m.page = PageLogViewer
 }
