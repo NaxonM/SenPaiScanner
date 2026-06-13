@@ -137,6 +137,16 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 			r.Throughput = throughput
 		}
 
+		// After a successful HTTP probe, verify the connection can survive
+		// an idle hold. On Iranian ISPs, DPI often allows the initial trace
+		// GET but RSTs the connection shortly after — an idle hold catches
+		// this before the IP is marked healthy.
+		if cfg.Mode == ModeHTTP && httpStatus >= 200 && httpStatus < 400 && colo != "" {
+			if !probeStability(ctx, ip, cfg.Port, sni, cfg.Timeout) {
+				r.Latencies[i] = 0 // mark this try as failed
+			}
+		}
+
 		// Small jitter between tries to avoid looking like a scanner
 		if i < cfg.Tries-1 {
 			jitter := time.Duration(rand.Intn(50)+10) * time.Millisecond
@@ -445,6 +455,70 @@ func normalizeWSPath(path string) string {
 // probeDownload fetches a small sample from speed.cloudflare.com while forcing
 // the TCP connection to the candidate IP. This is still not a full Xray/V2Ray
 // test, but it catches many IPs that handshake cleanly and then stall on data.
+// probeStability performs a quick idle-hold check on a TLS connection to detect
+// DPI systems that RST connections after the initial handshake. It opens a TLS
+// connection, waits briefly without sending data, then checks if it's alive.
+// Returns true if the connection survived the idle period.
+func probeStability(ctx context.Context, ip net.IP, port int, sni string, timeout time.Duration) bool {
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+
+	dialTimeout := max(timeout/4, min(2*time.Second, timeout))
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	dialCtx, cancel := context.WithTimeout(ctx, max(timeout, 3*time.Second))
+	defer cancel()
+
+	conn, err := dialer.DialContext(dialCtx, "tcp", addr)
+	if err != nil {
+		return false
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         sni,
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true,
+	})
+
+	handshakeTimeout := max(timeout/2, min(3*time.Second, timeout))
+	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer handshakeCancel()
+
+	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+		conn.Close()
+		return false
+	}
+
+	// Idle hold: wait without sending data. DPI often RSTs connections that
+	// look like long-lived TLS tunnels without early application data.
+	idleHold := 1500 * time.Millisecond
+	if deadline, ok := dialCtx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < 2*idleHold {
+			idleHold = remaining / 2
+		}
+	}
+	if idleHold < 500*time.Millisecond {
+		idleHold = 500*time.Millisecond
+	}
+	if idleHold < 500*time.Millisecond {
+		idleHold = 500 * time.Millisecond
+	}
+
+	idleDeadline := time.Now().Add(idleHold)
+	_ = tlsConn.SetReadDeadline(idleDeadline)
+	buf := make([]byte, 1)
+	_, err = tlsConn.Read(buf)
+	tlsConn.Close()
+
+	// A timeout here is EXPECTED (server didn't send data during idle).
+	// Any other error (RST, EOF) means the connection was killed by DPI.
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return true // timeout during idle = connection survived
+		}
+		return false
+	}
+	return true
+}
+
 func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Duration, bytes int64, insecure bool) float64 {
 	if bytes <= 0 {
 		return 0

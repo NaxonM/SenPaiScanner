@@ -71,10 +71,10 @@ func TestSort(t *testing.T) {
 
 func TestTopN(t *testing.T) {
 	results := []*Result{
-		{IP: net.ParseIP("1.1.1.1"), Latencies: []time.Duration{200 * time.Millisecond}, TLSOk: true},
-		{IP: net.ParseIP("1.1.1.2"), Latencies: []time.Duration{50 * time.Millisecond}, TLSOk: true},
-		{IP: net.ParseIP("1.1.1.3"), Latencies: []time.Duration{0}}, // unhealthy
-		{IP: net.ParseIP("1.1.1.4"), Latencies: []time.Duration{100 * time.Millisecond}, TLSOk: true},
+		{IP: net.ParseIP("1.1.1.1"), Latencies: []time.Duration{200 * time.Millisecond, 210 * time.Millisecond}, TLSOk: true},
+		{IP: net.ParseIP("1.1.1.2"), Latencies: []time.Duration{50 * time.Millisecond, 55 * time.Millisecond}, TLSOk: true},
+		{IP: net.ParseIP("1.1.1.3"), Latencies: []time.Duration{0, 0}}, // unhealthy
+		{IP: net.ParseIP("1.1.1.4"), Latencies: []time.Duration{100 * time.Millisecond, 105 * time.Millisecond}, TLSOk: true},
 	}
 	top := TopN(results, 2)
 	if len(top) != 2 {
@@ -100,9 +100,10 @@ func TestHTTPHealthRequiresCloudflareValidation(t *testing.T) {
 		t.Fatal("expected validated HTTP result to be healthy")
 	}
 
+	// Speed tested but 0 throughput = unhealthy (DPI allows trace but blocks data)
 	r.SpeedTested = true
-	if !r.IsHealthy() {
-		t.Fatal("expected trace-validated result to stay healthy without throughput (mobile-friendly)")
+	if r.IsHealthy() {
+		t.Fatal("expected speed-tested result with 0 throughput to be unhealthy")
 	}
 
 	r.Throughput = 256 * 1024
@@ -112,7 +113,7 @@ func TestHTTPHealthRequiresCloudflareValidation(t *testing.T) {
 }
 
 func TestHTTPHealthRequiresTLSOnNonPlainHTTPPorts(t *testing.T) {
-	r := makeResult([]time.Duration{100 * time.Millisecond})
+	r := makeResult([]time.Duration{100 * time.Millisecond, 110 * time.Millisecond})
 	r.ProbeMode = "http"
 	r.Port = 2087
 	r.TLSOk = false
@@ -125,7 +126,7 @@ func TestHTTPHealthRequiresTLSOnNonPlainHTTPPorts(t *testing.T) {
 }
 
 func TestHTTPHealthRequiresWebSocketWhenConfigured(t *testing.T) {
-	r := makeResult([]time.Duration{100 * time.Millisecond})
+	r := makeResult([]time.Duration{100 * time.Millisecond, 105 * time.Millisecond})
 	r.ProbeMode = "http"
 	r.HTTPStatus = 200
 	r.Colo = "FRA"
@@ -155,7 +156,7 @@ func TestHTTPTimeoutIsNotHealthy(t *testing.T) {
 }
 
 func TestTLSRequiresHandshake(t *testing.T) {
-	r := makeResult([]time.Duration{100 * time.Millisecond})
+	r := makeResult([]time.Duration{100 * time.Millisecond, 110 * time.Millisecond})
 	r.ProbeMode = "tls"
 	r.TLSOk = false
 	if r.IsHealthy() {
@@ -206,7 +207,7 @@ func TestSortByLossPrefersPartialOverTotalFailure(t *testing.T) {
 func TestSortBySpeedKeepsHealthyResultsAheadOfUntestedFailures(t *testing.T) {
 	results := []*Result{
 		{IP: net.ParseIP("1.1.1.1"), Latencies: []time.Duration{0, 0, 0}, Throughput: 0},
-		{IP: net.ParseIP("1.1.1.2"), Latencies: []time.Duration{80 * time.Millisecond}, Throughput: 100 * 1024, TLSOk: true},
+		{IP: net.ParseIP("1.1.1.2"), Latencies: []time.Duration{80 * time.Millisecond, 85 * time.Millisecond}, Throughput: 100 * 1024, TLSOk: true},
 	}
 
 	Sort(results, SortBySpeed)

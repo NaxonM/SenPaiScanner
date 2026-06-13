@@ -71,7 +71,7 @@ func TestRunConfigPortProbesCompletesWhenNeighborsFillQueue(t *testing.T) {
 					IP:        ip,
 					Port:      cfg.Port,
 					ProbeMode: cfg.Mode.String(),
-					Latencies: []time.Duration{time.Millisecond},
+					Latencies: []time.Duration{time.Millisecond, time.Millisecond},
 					Timestamp: time.Now(),
 				}
 			},

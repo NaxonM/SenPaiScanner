@@ -43,7 +43,7 @@ func TestLiveResultWriterRewritesHealthyPhase1Rows(t *testing.T) {
 	w.AddPhase1(&result.Result{
 		IP:         net.ParseIP("104.18.1.1"),
 		Port:       443,
-		Latencies:  []time.Duration{100 * time.Millisecond},
+		Latencies:  []time.Duration{100 * time.Millisecond, 110 * time.Millisecond},
 		ProbeMode:  "http",
 		TLSOk:      true,
 		HTTPStatus: 200,

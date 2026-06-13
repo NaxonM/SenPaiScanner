@@ -510,7 +510,7 @@ func defaultPhase1ProbeConfig(timeout time.Duration) prober.Config {
 	return prober.Config{
 		Port:               443,
 		Mode:               prober.ModeHTTP,
-		Tries:              3,
+		Tries:              4,
 		Timeout:            timeout,
 		SNI:                "speed.cloudflare.com",
 		InsecureSkipVerify: true,
@@ -531,7 +531,7 @@ func configProbeFromURL(rawURL string, timeout time.Duration) (prober.Config, er
 	probeCfg := prober.Config{
 		Port:               cfg.Port,
 		Mode:               prober.ModeHTTP,
-		Tries:              3,
+		Tries:              4,
 		Timeout:            timeout,
 		SNI:                sni,
 		InsecureSkipVerify: true,
@@ -714,11 +714,10 @@ func speedSampleForMode(mode prober.Mode) int64 {
 	if mode != prober.ModeHTTP {
 		return 0
 	}
-	// 64 KB is enough to detect IPs that stall on real data while still
-	// completing reliably on restricted/high-latency networks. 256 KB was too
-	// large: on throttled connections it consistently timed out, making every
-	// IP appear unhealthy even when the trace GET succeeded fine.
-	return 64 * 1024
+	// 128 KB gives DPI more time to act on the connection. On Iranian ISPs,
+	// smaller samples sometimes complete before DPI identifies and blocks
+	// proxy traffic patterns, producing false-positive "healthy" results.
+	return 128 * 1024
 }
 
 func parseTimeout(raw string, fallback time.Duration) time.Duration {

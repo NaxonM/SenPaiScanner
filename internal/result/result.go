@@ -101,6 +101,20 @@ func (r *Result) Jitter() time.Duration {
 // IsHealthy returns true only when the probe mode's success criteria are met.
 // A failed try must record latency 0; timeouts must never count as success.
 func (r *Result) IsHealthy() bool {
+	if len(r.Latencies) < 2 {
+		return false
+	}
+
+	successCount := 0
+	for _, l := range r.Latencies {
+		if l > 0 {
+			successCount++
+		}
+	}
+	if successCount < 2 {
+		return false
+	}
+
 	if r.Loss() >= 50 || r.Avg() <= 0 {
 		return false
 	}
@@ -114,8 +128,12 @@ func (r *Result) IsHealthy() bool {
 		if r.HTTPStatus < 200 || r.HTTPStatus >= 400 || r.Colo == "" {
 			return false
 		}
-		// Throughput is informational in Phase 1; trace reachability is enough.
-		// Slow mobile links often pass trace but fail a 64 KiB sample download.
+		// Require successful download when a speed test was attempted.
+		// On Iranian ISPs, /cdn-cgi/trace succeeds but actual data transfer
+		// fails — this catches IPs that are reachable but can't carry traffic.
+		if r.SpeedTested && r.Throughput <= 0 {
+			return false
+		}
 		if r.RequireWS && !r.WSOk {
 			return false
 		}
