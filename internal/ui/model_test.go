@@ -244,12 +244,12 @@ func TestWorkingEndpointsIncludePorts(t *testing.T) {
 	}
 }
 
-func TestGenericScanCopyDoesNotExportHealthyIPs(t *testing.T) {
+func TestGenericScanCopyHealthyIPs(t *testing.T) {
 	m := AppModel{page: PageResults}
 	next, _ := m.handleResultsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	got := next.(AppModel).statusMsg
-	if !strings.Contains(got, "Find Working IPs") {
-		t.Fatalf("generic copy message = %q", got)
+	if got != "no healthy IPs to copy" {
+		t.Fatalf("expected 'no healthy IPs to copy', got %q", got)
 	}
 }
 

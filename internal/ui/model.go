@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -523,6 +524,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ConfigDoneMsg:
 		m.configScanning = false
 		m.configDone = true
+		sort.Slice(m.configResults, func(i, j int) bool {
+			if m.configResults[i].Success != m.configResults[j].Success {
+				return m.configResults[i].Success
+			}
+			if m.configResults[i].Throughput != m.configResults[j].Throughput {
+				return m.configResults[i].Throughput > m.configResults[j].Throughput
+			}
+			return m.configResults[i].Latency < m.configResults[j].Latency
+		})
 		return m, nil
 
 	case ConfigPhase1ResultMsg:
@@ -698,7 +708,7 @@ func (m AppModel) handleResultsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sortBy = result.SortBy(m.sortIdx)
 		result.Sort(m.scanResults, m.sortBy)
 	case "c":
-		m.statusMsg = "use Find Working IPs to copy config-tested IPs"
+		m.statusMsg = m.copyHealthyIPsToClipboard()
 	}
 	return m, nil
 }
@@ -2587,10 +2597,10 @@ func (m AppModel) startConfigPhase2(topIPs []*result.Result) tea.Cmd {
 	workers := m.resolvePhase2Workers()
 
 	// Xray validation has startup and SOCKS proxy overheads.
-	// We enforce a minimum floor of 10s and scale with the user timeout.
+	// We enforce a minimum floor of 20s and scale with the user timeout.
 	xrayTimeout := timeout * 2
-	if xrayTimeout < 10*time.Second {
-		xrayTimeout = 10 * time.Second
+	if xrayTimeout < 20*time.Second {
+		xrayTimeout = 20 * time.Second
 	}
 
 	// Add dynamic budget for speed testing if a speed check is requested/configured.

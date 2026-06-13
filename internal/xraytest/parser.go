@@ -65,18 +65,27 @@ type VLESSConfig struct {
 func ParseProxyURL(raw string) (*VLESSConfig, error) {
 	raw = strings.TrimSpace(raw)
 	lower := strings.ToLower(raw)
+	var cfg *VLESSConfig
+	var err error
 	switch {
 	case strings.HasPrefix(lower, "vless://"):
-		return ParseVLESS(raw)
+		cfg, err = ParseVLESS(raw)
 	case strings.HasPrefix(lower, "trojan://"):
-		return ParseTrojan(raw)
+		cfg, err = ParseTrojan(raw)
 	case strings.HasPrefix(lower, "vmess://"):
-		return ParseVMess(raw)
+		cfg, err = ParseVMess(raw)
 	case strings.HasPrefix(lower, "ss://"):
-		return ParseShadowsocks(raw)
+		cfg, err = ParseShadowsocks(raw)
 	default:
 		return nil, fmt.Errorf("unsupported URL scheme — must start with vless://, trojan://, vmess://, or ss://")
 	}
+	if err != nil {
+		return nil, err
+	}
+	if cfg != nil && cfg.Insecure {
+		return nil, fmt.Errorf("allowInsecure/insecure is set to true (unsupported in latest xray-core)")
+	}
+	return cfg, nil
 }
 
 // ParseVMess parses a vmess:// share URL (base64-encoded JSON) into a VLESSConfig.
@@ -536,6 +545,9 @@ func normalizeSharePath(params url.Values) {
 func (c *VLESSConfig) Phase2SanityError() string {
 	if c == nil {
 		return "empty config"
+	}
+	if c.Insecure {
+		return "allowInsecure/insecure is set to true (unsupported in latest xray-core)"
 	}
 	switch c.Network {
 	case "ws", "xhttp", "splithttp":
