@@ -61,22 +61,6 @@ func CancelScanCmd() tea.Cmd {
 	}
 }
 
-// StartTestCmd runs the test pass against a file of IPs.
-func StartTestCmd(ipFile string, scanID int64) tea.Cmd {
-	return func() tea.Msg {
-		go runTest(ipFile, scanID)
-		return nil
-	}
-}
-
-// StartColosCmd discovers accessible Cloudflare PoPs.
-func StartColosCmd(scanID int64) tea.Cmd {
-	return func() tea.Msg {
-		go runColos(scanID)
-		return nil
-	}
-}
-
 // prog is set by main before launching the Bubble Tea program so the
 // background goroutines can send messages back.
 var prog *tea.Program
@@ -194,106 +178,6 @@ func runScan(cfg ScanConfig, scanID int64) {
 	sendDone(scanID)
 }
 
-func runTest(ipFile string, scanID int64) {
-	ips, err := loadIPs(ipFile)
-	if err != nil {
-		scanLog.Error(logger.PhaseQuick, "test IPs failed: %v", err)
-		sendError(scanID, fmt.Sprintf("Test IPs failed: %v", err))
-		sendDone(scanID)
-		return
-	}
-	if len(ips) == 0 {
-		scanLog.Error(logger.PhaseQuick, "no valid IPs found in %s", ipFile)
-		sendError(scanID, fmt.Sprintf("Test IPs failed: no valid IPs found in %s", ipFile))
-		sendDone(scanID)
-		return
-	}
-
-	scanLog.ScanStart(logger.PhaseQuick, map[string]any{
-		"file": ipFile, "ips": len(ips), "mode": "http", "tries": 6,
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	scanCancel = cancel
-	defer cancel()
-
-	engCfg := engine.Config{
-		Concurrency: 20,
-		ProbeConfig: prober.Config{
-			Port:             443,
-			Mode:             prober.ModeHTTP,
-			Tries:            6,
-			Timeout:          10 * time.Second,
-			SNI:              "speed.cloudflare.com",
-			SpeedBytes:       512 * 1024,
-			RequireWebSocket: true,
-		},
-	}
-	eng := engine.New(engCfg)
-
-	var tested, healthy int64
-	eng.RunList(ctx, ips, func(r *result.Result) {
-		s := eng.Stats()
-		tested = s.Tested.Load()
-		healthy = s.Healthy.Load()
-		if prog != nil {
-			prog.Send(ResultMsg{ScanID: scanID, Result: r})
-			prog.Send(StatsMsg{ScanID: scanID, Tested: tested, Healthy: healthy, Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
-		}
-	})
-
-	scanLog.ScanComplete(logger.PhaseQuick, int(tested), int(healthy), 0)
-	sendDone(scanID)
-}
-
-func runColos(scanID int64) {
-	src, err := ipsrc.New(true, false, nil)
-	if err != nil {
-		scanLog.Error(logger.PhaseColos, "setup failed: %v", err)
-		sendError(scanID, fmt.Sprintf("Colo discovery failed: %v", err))
-		sendColosDone(scanID)
-		return
-	}
-
-	scanLog.ScanStart(logger.PhaseColos, map[string]any{"count": 300})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	scanCancel = cancel
-	defer cancel()
-
-	engCfg := engine.Config{
-		Concurrency: 80,
-		ProbeConfig: prober.Config{
-			Port:       443,
-			Mode:       prober.ModeHTTP,
-			Tries:      2,
-			Timeout:    5 * time.Second,
-			SpeedBytes: 0,
-		},
-	}
-	eng := engine.New(engCfg)
-	ipStream := src.Stream(ctx, 300)
-
-	var tested, healthy int64
-	eng.Run(ctx, ipStream, func(r *result.Result) {
-		s := eng.Stats()
-		tested = s.Tested.Load()
-		healthy = s.Healthy.Load()
-		if prog != nil {
-			prog.Send(StatsMsg{ScanID: scanID, Tested: tested, Healthy: healthy, Failed: s.Failed.Load(), InFlight: s.InFlight.Load()})
-		}
-		if !r.IsHealthy() || r.Colo == "" {
-			return
-		}
-		if prog != nil {
-			prog.Send(ResultMsg{ScanID: scanID, Result: r})
-		}
-	})
-
-	scanLog.ScanComplete(logger.PhaseColos, int(tested), int(healthy), 0)
-	sendColosDone(scanID)
-}
-
 func sendError(scanID int64, text string) {
 	if prog != nil {
 		prog.Send(ErrorMsg{ScanID: scanID, Text: text})
@@ -303,12 +187,6 @@ func sendError(scanID int64, text string) {
 func sendDone(scanID int64) {
 	if prog != nil {
 		prog.Send(DoneMsg{ScanID: scanID})
-	}
-}
-
-func sendColosDone(scanID int64) {
-	if prog != nil {
-		prog.Send(ColosDoneMsg{ScanID: scanID})
 	}
 }
 
@@ -656,7 +534,7 @@ func ipsFileSearchPaths() []string {
 	if wd, err := os.Getwd(); err == nil {
 		add(&paths, filepath.Join(wd, "ips.txt"))
 	}
-	if exe, err := os.Executable(); err == nil {
+	if exe, err := osExecutable(); err == nil {
 		add(&paths, filepath.Join(filepath.Dir(exe), "ips.txt"))
 	}
 	return paths
@@ -688,12 +566,25 @@ func loadIPs(path string) ([]net.IP, error) {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "ip") {
+		if line == "" {
+			continue
+		}
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if idx := strings.Index(line, "//"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if line == "" || strings.HasPrefix(line, "ip") {
 			continue
 		}
 		field := strings.SplitN(line, ",", 2)[0]
 		field = strings.TrimSpace(field)
-		if ip := net.ParseIP(field); ip != nil {
+		host := field
+		if h, _, err := net.SplitHostPort(field); err == nil {
+			host = h
+		}
+		if ip := net.ParseIP(host); ip != nil {
 			if ip.To4() != nil {
 				ips = append(ips, ip)
 			}
